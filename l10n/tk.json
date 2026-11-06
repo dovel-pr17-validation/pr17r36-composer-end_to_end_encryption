@@ -1,0 +1,16 @@
+{ "translations": {
+    "Folder name" : "Papkanyň ady",
+    "Download" : "Göçürip almak",
+    "Unknown" : "Näbelli",
+    "File" : "Faýl",
+    "Password" : "Açarsöz",
+    "Note to recipient" : "Alyja bellik",
+    "Close" : "Ýap",
+    "Read only" : "Diňe okaň",
+    "Edit" : "Redaktirläň",
+    "Remove" : "Aýyrmak",
+    "Save" : "Saklamak",
+    "Uploading…" : "Ýüklenyas…",
+    "Cancel" : "ýatyrmak"
+},"pluralForm" :"nplurals=2; plural=(n != 1);"
+}

@@ -1,0 +1,180 @@
+/*!
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ * SPDX-FileCopyrightText: 2026 Nextcloud GmbH and Nextcloud contributors
+ */
+
+import type { IRawMetadataFileDrop } from '../models/metadata.d.ts'
+
+import { isAxiosError } from '@nextcloud/axios'
+import { getCapabilities } from '@nextcloud/capabilities'
+import { getClient, getRemoteURL, getRootPath } from '@nextcloud/files/dav'
+import { t } from '@nextcloud/l10n'
+import { join } from '@nextcloud/paths'
+import { getSharingToken } from '@nextcloud/sharing/public'
+import { FileDropEntry } from '../models/FileDropEntry.ts'
+import * as api from './api.ts'
+import { bufferToBase64 } from './bufferUtils.ts'
+import { encryptWithAES, exportAESKey, generateAESKey } from './crypto.ts'
+import logger from './logger.ts'
+import { generateUuid } from './uuid.ts'
+
+const client = getClient(getRemoteURL())
+
+/**
+ * Upload a file to a public share as a file drop.
+ *
+ * @param unencryptedFile - The file to upload
+ * @param fileId - The fileid of the e2ee root folder to add the file drop entry to
+ * @param shareToken - The share token of the public share to upload the file to
+ * @param users - Mapping of user IDs to their public keys to encrypt the file drop entry for
+ */
+export async function uploadFileDrop(unencryptedFile: File, fileId: string, shareToken: string, users: { userId: string, key: CryptoKey }[]): Promise<[string, IRawMetadataFileDrop]> {
+	const key = await generateAESKey()
+	const encryptedFileName = generateUuid()
+
+	const encryptedFileData = await handleUpload(encryptedFileName, unencryptedFile, key)
+	const keyData = await exportAESKey(key)
+
+	const fileDropEntry = new FileDropEntry({
+		filename: unencryptedFile.name,
+		mimetype: unencryptedFile.type,
+		authenticationTag: encryptedFileData.tag,
+		nonce: encryptedFileData.iv,
+		key: bufferToBase64(keyData),
+		// EXPERIMENTAL
+		chunked: encryptedFileData.chunked ? true : undefined,
+		filesize: unencryptedFile.size,
+	})
+
+	const rawEntry = await fileDropEntry.export(users)
+	return [encryptedFileName, rawEntry]
+}
+
+/**
+ * Finalize the file drop by uploading the metadata entries.
+ *
+ * @param entries - The entries to upload
+ * @param fileId - The id of the file drop folder to add the entries to
+ * @param shareToken - The current share token of the public share to upload the entries to
+ */
+export async function finalizeFileDrop(entries: Record<string, IRawMetadataFileDrop>, fileId: string, shareToken: string): Promise<null | string[]> {
+	return await api.addFileDrop(entries, fileId, shareToken)
+}
+
+/**
+ * Get a translated, user facing message for an error that occurred while uploading a file drop file.
+ *
+ * @param error - The error thrown by the upload or by finalizing the file drop
+ */
+export function getUploadErrorMessage(error: unknown): string {
+	const status = getErrorStatus(error)
+	// reading or encrypting a file that does not fit into memory fails with a RangeError
+	if (status === 413 || error instanceof RangeError) {
+		return t('end_to_end_encryption', 'The file is too large to be uploaded.')
+	}
+	if (status === 507) {
+		return t('end_to_end_encryption', 'There is not enough free space to upload the file.')
+	}
+	if (status === 401 || status === 403) {
+		return t('end_to_end_encryption', 'You are not allowed to upload files to this share.')
+	}
+	if (status === 404) {
+		return t('end_to_end_encryption', 'The share does not exist anymore.')
+	}
+	// requests that never got a response: fetch rejects with a TypeError, axios with an error without response
+	if (status === undefined && (error instanceof TypeError || isAxiosError(error))) {
+		return t('end_to_end_encryption', 'The connection to the server was lost. Please check your network connection and try again.')
+	}
+	return t('end_to_end_encryption', 'An unexpected error occurred while uploading the file.')
+}
+
+/**
+ * Get the HTTP status code of a failed request.
+ * Handles errors thrown by the WebDAV client (`error.status`) as well as by axios (`error.response.status`).
+ *
+ * @param error - The error to get the status code of
+ */
+function getErrorStatus(error: unknown): number | undefined {
+	if (isAxiosError(error)) {
+		return error.response?.status
+	}
+	if (error instanceof Error && 'status' in error && typeof error.status === 'number') {
+		return error.status
+	}
+	return undefined
+}
+
+/**
+ * Handle the upload of the file-drop file.
+ *
+ * @param encryptedFileName - The name to use for the encrypted file on the server
+ * @param source - The unencrypted file to upload
+ * @param key - The AES key to encrypt the file with
+ */
+async function handleUpload(encryptedFileName: string, source: File, key: CryptoKey): Promise<{ iv: string, tag: string, chunked: boolean }> {
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	const supportChunking = (getCapabilities() as any).end_to_end_encryption?.supports_chunking === true
+	if (supportChunking && source.size > 10 * 1024 * 1024) {
+		logger.debug('Using chunked upload for file drop file', { filename: source.name, size: source.size })
+
+		await handleChunkedUpload(encryptedFileName, source, key)
+		return {
+			iv: '',
+			tag: '',
+			chunked: true,
+		}
+	} else {
+		logger.debug('Using non-chunked upload for file drop file', { filename: source.name, size: source.size })
+
+		const buffer = await source.arrayBuffer()
+		const encryptedFileData = await encryptWithAES(buffer, key)
+		await client.putFileContents(
+			join(getRootPath(), encryptedFileName),
+			encryptedFileData.encryptedContent.buffer,
+		)
+		return {
+			iv: bufferToBase64(encryptedFileData.iv),
+			tag: bufferToBase64(encryptedFileData.tag),
+			chunked: false,
+		}
+	}
+}
+
+/**
+ * Handle the upload of a file in chunks.
+ *
+ * @param encryptedFileName - The name to use for the encrypted file on the server
+ * @param source - The unencrypted file to upload
+ * @param key - The AES key to encrypt the file with
+ */
+async function handleChunkedUpload(encryptedFileName: string, source: File, key: CryptoKey): Promise<void> {
+	const CHUNKED_HEADER_VERSION = 1
+	const CHUNKED_HEADER_SIZE = 37 // 4 byte magic + 1 byte version + 4 byte length + 12 byte IV + 16 byte tag
+	const CHUNKED_HEADER = new Uint8Array([0x65, 0x32, 0x65, 0x65, CHUNKED_HEADER_VERSION]) // "e2ee" + version
+
+	const numberOfChunks = Math.min(999, Math.ceil(source.size / (10 * 1024 * 1024))) // max 999 chunks, but better 10MB slices
+	const rootPath = join(`/uploads/${getSharingToken()}`, encryptedFileName)
+
+	// create the upload root
+	await client.createDirectory(rootPath)
+	for (let i = 0; i < numberOfChunks; i++) {
+		const chunkBlob = source.slice(i * source.size / numberOfChunks, (i + 1) * source.size / numberOfChunks)
+		const chunkBuffer = await chunkBlob.arrayBuffer()
+		const encryptedChunkData = await encryptWithAES(chunkBuffer, key)
+
+		// we remove the tag from the end of the encrypted content
+		const encryptedLength = encryptedChunkData.encryptedContent.byteLength - encryptedChunkData.tag.byteLength
+
+		const dataWithHeader = new Uint8Array(encryptedLength + CHUNKED_HEADER_SIZE)
+		dataWithHeader.set(CHUNKED_HEADER, 0)
+		const lengthView = new DataView(dataWithHeader.buffer, CHUNKED_HEADER.byteLength, 4) // 4 bytes for the length after the header
+		lengthView.setUint32(0, encryptedLength, false) // big endian
+		dataWithHeader.set(encryptedChunkData.iv, CHUNKED_HEADER.byteLength + lengthView.byteLength)
+		dataWithHeader.set(encryptedChunkData.tag, CHUNKED_HEADER.byteLength + lengthView.byteLength + encryptedChunkData.iv.byteLength)
+		dataWithHeader.set(encryptedChunkData.encryptedContent.slice(0, encryptedLength), CHUNKED_HEADER_SIZE)
+
+		await client.putFileContents(join(rootPath, String(i)), dataWithHeader.buffer)
+	}
+	// assemble
+	await client.moveFile(join(rootPath, '.file'), join(getRootPath(), encryptedFileName))
+}

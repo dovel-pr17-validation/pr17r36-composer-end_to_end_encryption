@@ -1,0 +1,364 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * SPDX-FileCopyrightText: 2017 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+namespace OCA\EndToEndEncryption\Controller;
+
+use InvalidArgumentException;
+use OCA\EndToEndEncryption\AccessManager;
+use OCA\EndToEndEncryption\Attributes\E2ERestrictUserAgent;
+use OCA\EndToEndEncryption\Exceptions\MetaDataExistsException;
+use OCA\EndToEndEncryption\Exceptions\MissingMetaDataException;
+use OCA\EndToEndEncryption\IMetaDataStorage;
+use OCA\EndToEndEncryption\LockManager;
+use OCP\AppFramework\Http;
+use OCP\AppFramework\Http\Attribute\BruteForceProtection;
+use OCP\AppFramework\Http\Attribute\PublicPage;
+use OCP\AppFramework\Http\Attribute\RequestHeader;
+use OCP\AppFramework\Http\DataResponse;
+use OCP\AppFramework\OCS\OCSBadRequestException;
+use OCP\AppFramework\OCS\OCSForbiddenException;
+use OCP\AppFramework\OCS\OCSNotFoundException;
+use OCP\AppFramework\OCS\OCSPreconditionFailedException;
+use OCP\AppFramework\OCSController;
+use OCP\Files\Folder;
+use OCP\Files\IRootFolder;
+use OCP\Files\NotFoundException;
+use OCP\Files\NotPermittedException;
+use OCP\IL10N;
+use OCP\IRequest;
+use OCP\Share\IManager as ShareManager;
+use OCP\User\Exceptions\UserNotFoundException;
+use Psr\Log\LoggerInterface;
+
+class MetaDataController extends OCSController {
+	use ThrottleRequestTrait;
+
+	public function __construct(
+		string $AppName,
+		IRequest $request,
+		private readonly ?string $userId,
+		private readonly IMetaDataStorage $metaDataStorage,
+		private readonly LockManager $lockManager,
+		private readonly LoggerInterface $logger,
+		private readonly IL10N $l10n,
+		private readonly ShareManager $shareManager,
+		private readonly IRootFolder $rootFolder,
+		private readonly AccessManager $accessManager,
+	) {
+		parent::__construct($AppName, $request);
+	}
+
+	/**
+	 * Get metadata
+	 *
+	 * @param int $id File ID
+	 * @param ?string $shareToken Token of the share if available
+	 * @return DataResponse<Http::STATUS_OK, array{meta-data: string}, array{x-nc-e2ee-signature: string}>|DataResponse<Http::STATUS_FORBIDDEN, array{message: string}, array{}>
+	 * @throws OCSNotFoundException Metadata for the file not found
+	 * @throws OCSBadRequestException Cannot read metadata
+	 *
+	 * 200: Metadata returned
+	 * 403: Forbidden
+	 */
+	#[PublicPage]
+	#[E2ERestrictUserAgent]
+	#[BruteForceProtection(('e2ee'))]
+	#[RequestHeader(name: 'x-nc-e2ee-share-token', description: 'The share token when interacting with the API as an external share user', indirect: true)]
+	public function getMetaData(int $id): DataResponse {
+		try {
+			$this->accessManager->checkPermissions($id, false);
+
+			$ownerId = $this->accessManager->getOwnerId($id);
+			$metaData = $this->metaDataStorage->getMetaData($ownerId, $id);
+		} catch (NotFoundException) {
+			throw new OCSNotFoundException($this->l10n->t('Could not find metadata for "%s"', [$id]));
+		} catch (\InvalidArgumentException|NotPermittedException $e) {
+			$this->logger->warning('Unauthorized access to metadata API', ['exception' => $e]);
+			return $this->throttleRequest(Http::STATUS_FORBIDDEN, 'You are not allowed to access the metadata of this folder');
+		} catch (\Exception $e) {
+			$this->logger->critical($e->getMessage(), ['exception' => $e, 'app' => $this->appName]);
+			throw new OCSBadRequestException($this->l10n->t('Cannot read metadata'));
+		}
+		return new DataResponse(
+			['meta-data' => $metaData],
+			Http::STATUS_OK,
+			['x-nc-e2ee-signature' => $this->metaDataStorage->readSignature($id)],
+		);
+	}
+
+	/**
+	 * Set metadata
+	 *
+	 * @param int $id File ID
+	 * @param string $metaData New metadata
+	 * @return DataResponse<Http::STATUS_OK, array{meta-data: string}, array{}>|DataResponse<Http::STATUS_BAD_REQUEST|Http::STATUS_FORBIDDEN|Http::STATUS_CONFLICT, array{message: string}, array{}>
+	 * @throws OCSNotFoundException Metadata-file does not exist
+	 * @throws OCSBadRequestException Cannot store metadata
+	 *
+	 * 200: Metadata set successfully
+	 * 409: Metadata already exists
+	 * 403: Forbidden
+	 */
+	#[PublicPage]
+	#[E2ERestrictUserAgent]
+	#[BruteForceProtection('e2ee')]
+	#[RequestHeader(name: 'e2e-token', description: 'The lock token this folder was locked with')]
+	#[RequestHeader(name: 'x-nc-e2ee-signature', description: 'The signature of the metadata to verify integrity')]
+	#[RequestHeader(name: 'x-nc-e2ee-share-token', description: 'The share token when interacting with the API as an external share user', indirect: true)]
+	public function setMetaData(int $id, string $metaData): DataResponse {
+		$e2eToken = $this->request->getHeader('e2e-token');
+		$signature = $this->request->getHeader('x-nc-e2ee-signature');
+
+		if ($e2eToken === '') {
+			return $this->throttleRequest(Http::STATUS_BAD_REQUEST, 'e2e-token is empty');
+		}
+
+		if ($signature === '') {
+			return $this->throttleRequest(Http::STATUS_BAD_REQUEST, 'x-nc-e2ee-signature is empty');
+		}
+
+		try {
+			$this->accessManager->checkPermissions($id, true);
+			$ownerId = $this->accessManager->getOwnerId($id);
+			if ($this->lockManager->isLocked($id, $e2eToken, $ownerId, true)) {
+				throw new InvalidArgumentException('Metadata not locked');
+			}
+		} catch (\InvalidArgumentException $e) {
+			$this->logger->warning('Unauthorized access to metadata API', ['exception' => $e]);
+			return $this->throttleRequest(Http::STATUS_FORBIDDEN, 'You are not allowed to set the metadata on this folder');
+		}
+
+		try {
+			$this->metaDataStorage->setMetaDataIntoIntermediateFile($ownerId, $id, $metaData, $e2eToken, $signature);
+		} catch (MetaDataExistsException) {
+			return new DataResponse([], Http::STATUS_CONFLICT);
+		} catch (NotFoundException $e) {
+			throw new OCSNotFoundException($e->getMessage());
+		} catch (\Exception $e) {
+			$this->logger->critical($e->getMessage(), ['exception' => $e, 'app' => $this->appName]);
+			throw new OCSBadRequestException($this->l10n->t('Cannot store metadata'));
+		}
+
+		return new DataResponse(['meta-data' => $metaData]);
+	}
+
+	/**
+	 * Update metadata
+	 *
+	 * @param int $id File ID
+	 * @param string $metaData New metadata
+	 * @return DataResponse<Http::STATUS_OK, array{meta-data: string}, array{}>|DataResponse<Http::STATUS_BAD_REQUEST|Http::STATUS_FORBIDDEN|Http::STATUS_PRECONDITION_FAILED, array{message: string}, array{}>
+	 * @throws OCSForbiddenException User is not allowed to edit the file
+	 * @throws OCSBadRequestException Cannot store metadata
+	 * @throws OCSNotFoundException Metadata-file does not exist
+	 *
+	 * 200: Metadata updated successfully
+	 * 412: Folder is not locked
+	 */
+	#[PublicPage]
+	#[E2ERestrictUserAgent]
+	#[BruteForceProtection('e2ee')]
+	#[RequestHeader(name: 'e2e-token', description: 'The lock token this folder was locked with')]
+	#[RequestHeader(name: 'x-nc-e2ee-signature', description: 'The signature of the metadata to verify integrity')]
+	#[RequestHeader(name: 'x-nc-e2ee-share-token', description: 'The share token when interacting with the API as an external share user', indirect: true)]
+	public function updateMetaData(int $id, string $metaData): DataResponse {
+		$e2eToken = $this->request->getHeader('e2e-token');
+		$signature = $this->request->getHeader('x-nc-e2ee-signature');
+
+		if ($e2eToken === '') {
+			return $this->throttleRequest(Http::STATUS_BAD_REQUEST, 'e2e-token is empty');
+		}
+
+		if ($signature === '') {
+			return $this->throttleRequest(Http::STATUS_BAD_REQUEST, 'x-nc-e2ee-signature is empty');
+		}
+
+		try {
+			$this->accessManager->checkPermissions($id, true);
+			$ownerId = $this->accessManager->getOwnerId($id);
+		} catch (InvalidArgumentException $e) {
+			$this->logger->warning('Unauthorized access to metadata API', ['exception' => $e]);
+			return $this->throttleRequest(Http::STATUS_FORBIDDEN, 'You are not allowed to set the metadata on this folder');
+		}
+
+		if ($this->lockManager->isLocked($id, $e2eToken, $ownerId, true)) {
+			return $this->throttleRequest(Http::STATUS_PRECONDITION_FAILED, 'Folder is not locked');
+		}
+
+		try {
+			$this->metaDataStorage->updateMetaDataIntoIntermediateFile($ownerId, $id, $metaData, $e2eToken, $signature);
+		} catch (MissingMetaDataException) {
+			throw new OCSNotFoundException($this->l10n->t('Metadata-file does not exist'));
+		} catch (NotFoundException $e) {
+			throw new OCSNotFoundException($e->getMessage());
+		} catch (\Exception $e) {
+			$this->logger->critical($e->getMessage(), ['exception' => $e, 'app' => $this->appName]);
+			throw new OCSBadRequestException($this->l10n->t('Cannot store metadata'));
+		}
+
+		return new DataResponse(['meta-data' => $metaData]);
+	}
+
+	/**
+	 * Delete metadata
+	 *
+	 * @param int $id file id
+	 * @return DataResponse<Http::STATUS_OK, list<empty>, array{}>|DataResponse<Http::STATUS_BAD_REQUEST|Http::STATUS_FORBIDDEN|Http::STATUS_PRECONDITION_FAILED, array{message: string}, array{}>
+	 *
+	 * @throws OCSForbiddenException User is not allowed to edit the file
+	 * @throws OCSNotFoundException Metadata for the file not found
+	 * @throws OCSBadRequestException Cannot delete metadata
+	 *
+	 * 200: Metadata deleted successfully
+	 * 412: Folder is not locked
+	 */
+	#[PublicPage]
+	#[E2ERestrictUserAgent]
+	#[BruteForceProtection('e2ee')]
+	#[RequestHeader(name: 'e2e-token', description: 'The lock token this folder was locked with')]
+	#[RequestHeader(name: 'x-nc-e2ee-share-token', description: 'The share token when interacting with the API as an external share user', indirect: true)]
+	public function deleteMetaData(int $id): DataResponse {
+		$e2eToken = $this->request->getHeader('e2e-token');
+
+		if ($e2eToken === '') {
+			return $this->throttleRequest(Http::STATUS_BAD_REQUEST, 'e2e-token is empty');
+		}
+
+		try {
+			$this->accessManager->checkPermissions($id, true);
+			$ownerId = $this->accessManager->getOwnerId($id);
+		} catch (InvalidArgumentException $e) {
+			$this->logger->warning('Unauthorized access to metadata API', ['exception' => $e]);
+			return $this->throttleRequest(Http::STATUS_FORBIDDEN, 'You are not allowed to delete the metadata of this folder');
+		}
+
+		if ($this->lockManager->isLocked($id, $e2eToken, $ownerId, true)) {
+			$this->logger->debug('Tried to delete metadata without lock');
+			return $this->throttleRequest(Http::STATUS_PRECONDITION_FAILED, 'Metadata is not locked');
+		}
+
+		try {
+			$this->metaDataStorage->updateMetaDataIntoIntermediateFile($ownerId, $id, '{}', $e2eToken, '');
+		} catch (NotFoundException) {
+			throw new OCSNotFoundException($this->l10n->t('Could not find metadata for "%s"', [$id]));
+		} catch (NotPermittedException $e) {
+			$this->logger->warning('Unauthorized access to metadata API', ['exception' => $e]);
+			return $this->throttleRequest(Http::STATUS_FORBIDDEN, 'You are not allowed to delete the metadata of this folder');
+		} catch (\Exception $e) {
+			$this->logger->critical($e->getMessage(), ['exception' => $e, 'app' => $this->appName]);
+			throw new OCSBadRequestException($this->l10n->t('Cannot delete metadata'));
+		}
+		return new DataResponse();
+	}
+
+	/**
+	 * Append new entries in the filedrop property of a metadata
+	 *
+	 * @param int $id File ID
+	 * @param string $filedrop File drop metadata
+	 * @param ?string $shareToken Token of the share if available
+	 * @return DataResponse<Http::STATUS_OK, array{filedrop: string}, array{}>|DataResponse<Http::STATUS_BAD_REQUEST|Http::STATUS_FORBIDDEN, array{message: string}, array{}>
+	 * @throws OCSForbiddenException User is not allowed to create the lock
+	 * @throws OCSBadRequestException Cannot update filedrop
+	 * @throws OCSNotFoundException Metadata-file does not exist
+	 *
+	 * 200: Filedrop metadata added successfully
+	 */
+	#[PublicPage]
+	#[BruteForceProtection('e2ee')]
+	public function addMetadataFileDrop(int $id, string $filedrop, ?string $shareToken = null): DataResponse {
+		if ($this->userId === null && $shareToken === null) {
+			return $this->throttleRequest(Http::STATUS_BAD_REQUEST, "No 'shareToken' provided and user is not logged in");
+		}
+
+		try {
+			/** @var string */
+			$ownerId = $shareToken
+				? $this->getFileDropOwnerId($shareToken, $id)
+				: $this->userId;
+			$userFolder = $this->rootFolder->getUserFolder($ownerId);
+		} catch (UserNotFoundException|OCSForbiddenException $e) {
+			$this->logger->error('Tried to create filedrop lock without permission', ['exception' => $e]);
+			return $this->throttleRequest(Http::STATUS_FORBIDDEN, $this->l10n->t('You are not allowed to create the lock'));
+		}
+
+		if ($userFolder->getId() === $id) {
+			$this->logger->error('Cannot create filedrop lock on root folder of user {userId}', ['userId' => $ownerId]);
+			return $this->throttleRequest(Http::STATUS_FORBIDDEN, $this->l10n->t('You are not allowed to create the lock'));
+		}
+
+		$node = $userFolder->getFirstNodeById($id);
+		if (!$node instanceof Folder) {
+			$this->logger->error('Cannot create filedrop lock on non-folder node', ['nodeId' => $id]);
+			return $this->throttleRequest(Http::STATUS_FORBIDDEN, $this->l10n->t('You are not allowed to create the lock'));
+		}
+
+		$lockToken = $this->lockManager->lockFile($id, 'filedrop-lock', 0, $ownerId, true);
+		if ($lockToken === null) {
+			throw new OCSPreconditionFailedException($this->l10n->t('File already locked'));
+		}
+
+		try {
+			$metaData = $this->metaDataStorage->getMetaData($ownerId, $id);
+			$decodedMetadata = json_decode($metaData, true);
+			$fileDropArray = $decodedMetadata['filedrop'] ?? [];
+			$fileDropArray = array_merge($fileDropArray, json_decode($filedrop, true));
+			$decodedMetadata['filedrop'] = $fileDropArray;
+			$encodedMetadata = json_encode($decodedMetadata);
+
+			$this->metaDataStorage->updateMetaDataIntoIntermediateFile($ownerId, $id, $encodedMetadata, 'filedrop-lock');
+			$this->metaDataStorage->saveIntermediateFile($ownerId, $id);
+		} catch (MissingMetaDataException) {
+			throw new OCSNotFoundException($this->l10n->t('Metadata-file does not exist'));
+		} catch (NotFoundException $e) {
+			throw new OCSNotFoundException($e->getMessage());
+		} catch (\Exception $e) {
+			$this->logger->critical($e->getMessage(), ['exception' => $e, 'app' => $this->appName]);
+			throw new OCSBadRequestException($this->l10n->t('Cannot update filedrop'));
+		} finally {
+			$this->lockManager->unlockFile($id, $lockToken);
+		}
+
+		return new DataResponse(['filedrop' => json_decode($filedrop, true)]);
+	}
+
+	private function getFileDropOwnerId(string $shareToken, int $fileId): string {
+		$share = $this->shareManager->getShareByToken($shareToken);
+
+		// if we are the owner of the node shared via the share, we can directly return our user id
+		if ($this->userId !== null && $share->getShareOwner() === $this->userId) {
+			return $this->userId;
+		}
+
+		if (!$this->accessManager->isShareAuthenticated($share)) {
+			throw new OCSForbiddenException($this->l10n->t('You are not allowed to create the lock'));
+		}
+
+		if (!($share->getPermissions() & \OCP\Constants::PERMISSION_CREATE)) {
+			throw new OCSForbiddenException($this->l10n->t('You are not allowed to create the lock'));
+		}
+
+		$shareRoot = $share->getNode();
+		if (!$shareRoot instanceof Folder) {
+			$this->logger->error('Cannot create filedrop lock on non-folder share {share}', ['share' => $shareToken]);
+			throw new OCSForbiddenException($this->l10n->t('You are not allowed to create the lock'));
+		}
+
+		if (!$shareRoot->isEncrypted()) {
+			$this->logger->error('Cannot create filedrop lock on non-encrypted folders of {share}', ['share' => $shareToken]);
+			throw new OCSForbiddenException($this->l10n->t('You are not allowed to create the lock'));
+		}
+
+		if ($shareRoot->getId() !== $fileId && ($shareRoot instanceof Folder && $shareRoot->getFirstNodeById($fileId) === null)) {
+			$this->logger->error('Cannot create filedrop lock on node outside of share {share}', ['share' => $shareToken, 'fileId' => $fileId]);
+			throw new OCSForbiddenException($this->l10n->t('You are not allowed to create the lock'));
+		}
+
+		return $share->getShareOwner();
+	}
+}

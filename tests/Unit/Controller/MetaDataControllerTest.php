@@ -1,0 +1,418 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * SPDX-FileCopyrightText: 2017 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+namespace OCA\EndToEndEncryption\Tests\Controller;
+
+use OCA\EndToEndEncryption\AccessManager;
+use OCA\EndToEndEncryption\Controller\MetaDataController;
+use OCA\EndToEndEncryption\Exceptions\MetaDataExistsException;
+use OCA\EndToEndEncryption\Exceptions\MissingMetaDataException;
+use OCA\EndToEndEncryption\IMetaDataStorage;
+use OCA\EndToEndEncryption\LockManager;
+use OCP\AppFramework\Http\DataResponse;
+use OCP\AppFramework\OCS\OCSBadRequestException;
+use OCP\AppFramework\OCS\OCSNotFoundException;
+use OCP\Constants;
+use OCP\Files\Folder;
+use OCP\Files\IRootFolder;
+use OCP\Files\IUserFolder;
+use OCP\Files\NotFoundException;
+use OCP\Files\NotPermittedException;
+use OCP\IL10N;
+use OCP\IRequest;
+use OCP\Share\IManager as ShareManager;
+use OCP\Share\IShare;
+use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
+use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\MockObject\MockObject;
+use PHPUnit\Framework\MockObject\Stub;
+use Psr\Log\LoggerInterface;
+use Test\TestCase;
+
+#[AllowMockObjectsWithoutExpectations]
+class MetaDataControllerTest extends TestCase {
+
+	private string $appName;
+	private IRequest&MockObject $request;
+	private string $userId;
+	private IMetaDataStorage&MockObject $metaDataStorage;
+	private LockManager&MockObject $lockManager;
+	private LoggerInterface&MockObject $logger;
+	private IL10N&Stub $l10n;
+	private ShareManager&Stub $shareManager;
+	private MetaDataController $controller;
+	private IRootFolder&Stub $rootFolder;
+	private AccessManager&Stub $accessManager;
+
+	protected function setUp(): void {
+		parent::setUp();
+
+		$this->appName = 'end_to_end_encryption';
+		$this->request = $this->createMock(IRequest::class);
+		$this->userId = 'john.doe';
+		$this->metaDataStorage = $this->createMock(IMetaDataStorage::class);
+		$this->lockManager = $this->createMock(LockManager::class);
+		$this->logger = $this->createMock(LoggerInterface::class);
+		$this->l10n = $this->createStub(IL10N::class);
+		$this->shareManager = $this->createStub(ShareManager::class);
+		$this->rootFolder = $this->createStub(IRootFolder::class);
+		$this->accessManager = $this->createStub(AccessManager::class);
+
+		$this->controller = new MetaDataController(
+			$this->appName,
+			$this->request,
+			$this->userId,
+			$this->metaDataStorage,
+			$this->lockManager,
+			$this->logger,
+			$this->l10n,
+			$this->shareManager,
+			$this->rootFolder,
+			$this->accessManager,
+		);
+	}
+
+	#[DataProvider('getMetaDataDataProvider')]
+	public function testGetMetaData(
+		?\Exception $metaDataStorageException,
+		?string $expectedException,
+		?string $expectedExceptionMessage,
+		bool $expectLogger,
+	): void {
+		$fileId = 42;
+		$metaData = 'JSON-ENCODED-META-DATA';
+
+		$this->accessManager->method('getOwnerId')
+			->willReturnMap([
+				[$fileId, 'john.doe'],
+			]);
+
+		if ($metaDataStorageException) {
+			$this->metaDataStorage->expects($this->once())
+				->method('getMetaData')
+				->with('john.doe', $fileId)
+				->willThrowException($metaDataStorageException);
+		} else {
+			$this->metaDataStorage->expects($this->once())
+				->method('getMetaData')
+				->with('john.doe', $fileId)
+				->willReturn($metaData);
+		}
+
+		$this->l10n->method('t')
+			->willReturnCallback(static fn ($string, $args): string => vsprintf($string, $args));
+
+		if ($expectLogger) {
+			$this->logger->expects($this->once())
+				->method('critical')
+				->with($metaDataStorageException->getMessage(), ['exception' => $metaDataStorageException, 'app' => $this->appName]);
+		}
+
+		if ($expectedException) {
+			$this->expectException($expectedException);
+			$this->expectExceptionMessage($expectedExceptionMessage);
+
+			$this->controller->getMetaData($fileId);
+		} else {
+			$response = $this->controller->getMetaData($fileId);
+			$this->assertInstanceOf(DataResponse::class, $response);
+			$this->assertEquals([
+				'meta-data' => $metaData
+			], $response->getData());
+		}
+	}
+
+	public static function getMetaDataDataProvider(): array {
+		return [
+			[null, null, null, false],
+			[new NotFoundException(), OCSNotFoundException::class, 'Could not find metadata for "42"', false],
+			[new \Exception(), OCSBadRequestException::class, 'Cannot read metadata', true],
+		];
+	}
+
+	#[DataProvider('setMetaDataDataProvider')]
+	public function testSetMetaData(?\Exception $metaDataStorageException,
+		?string $expectedException,
+		?string $expectedExceptionMessage,
+		bool $expectLogger,
+		?array $expectedResponseData,
+		?int $expectedResponseCode): void {
+		$fileId = 42;
+		$metaData = 'JSON-ENCODED-META-DATA';
+
+		$this->accessManager->method('getOwnerId')
+			->willReturnMap([
+				[$fileId, 'john.doe'],
+			]);
+
+		if ($metaDataStorageException) {
+			$this->metaDataStorage->expects($this->once())
+				->method('setMetaDataIntoIntermediateFile')
+				->with('john.doe', $fileId, $metaData)
+				->willThrowException($metaDataStorageException);
+		} else {
+			$this->metaDataStorage->expects($this->once())
+				->method('setMetaDataIntoIntermediateFile')
+				->with('john.doe', $fileId, $metaData);
+		}
+
+		$this->l10n->method('t')
+			->willReturnCallback(static fn ($string, $args): string => vsprintf($string, $args));
+		$this->request->expects($this->any())
+			->method('getHeader')
+			->willReturnMap([
+				['e2e-token', 'e2eeToken'],
+				['x-nc-e2ee-signature', 'e2eeSignature'],
+			]);
+
+		if ($expectLogger) {
+			$this->logger->expects($this->once())
+				->method('critical')
+				->with($metaDataStorageException->getMessage(), ['exception' => $metaDataStorageException, 'app' => $this->appName]);
+		}
+
+		if ($expectedException) {
+			$this->expectException($expectedException);
+			$this->expectExceptionMessage($expectedExceptionMessage);
+
+			$this->controller->setMetaData($fileId, $metaData);
+		} else {
+			$response = $this->controller->setMetaData($fileId, $metaData);
+			$this->assertInstanceOf(DataResponse::class, $response);
+			$this->assertEquals($expectedResponseData, $response->getData());
+			$this->assertEquals($expectedResponseCode, $response->getStatus());
+		}
+	}
+
+	public static function setMetaDataDataProvider(): array {
+		return [
+			[null, null, null, false, ['meta-data' => 'JSON-ENCODED-META-DATA'], 200],
+			[new MetaDataExistsException(), null, null, false, [], 409],
+			[new NotFoundException('Exception message'), OCSNotFoundException::class, 'Exception message', false, null, null],
+			[new \Exception(), OCSBadRequestException::class, 'Cannot store metadata', true, null, null],
+		];
+	}
+
+	#[DataProvider('updateMetaDataDataProvider')]
+	public function testUpdateMetaData(bool $isLocked,
+		?\Exception $metaDataStorageException,
+		?string $expectedException,
+		?string $expectedExceptionMessage,
+		?array $expectedResponseData,
+		?int $expectedResponseStatus,
+		bool $expectLogger): void {
+		$fileId = 42;
+		$sendToken = 'sendE2EToken';
+		$signature = 'signature';
+		$metaData = 'JSON-ENCODED-META-DATA';
+
+		$this->accessManager->method('getOwnerId')
+			->willReturnMap([
+				[$fileId, 'john.doe'],
+			]);
+
+		$this->request->expects($this->exactly(2))
+			->method('getHeader')
+			->willReturnMap([
+				['e2e-token', $sendToken],
+				['x-nc-e2ee-signature', $signature],
+			]);
+
+		$this->lockManager->expects($this->once())
+			->method('isLocked')
+			->with($fileId, $sendToken)
+			->willReturn($isLocked);
+
+		if (!$isLocked) {
+			if ($metaDataStorageException) {
+				$this->metaDataStorage->expects($this->once())
+					->method('updateMetaDataIntoIntermediateFile')
+					->with('john.doe', $fileId, $metaData, $sendToken, $signature)
+					->willThrowException($metaDataStorageException);
+			} else {
+				$this->metaDataStorage->expects($this->once())
+					->method('updateMetaDataIntoIntermediateFile')
+					->with('john.doe', $fileId, $metaData, $sendToken, $signature);
+			}
+		}
+
+		$this->l10n->method('t')
+			->willReturnCallback(static fn ($string, $args): string => vsprintf($string, $args));
+
+		if ($expectLogger) {
+			$this->logger->expects($this->once())
+				->method('critical')
+				->with($metaDataStorageException->getMessage(), ['exception' => $metaDataStorageException, 'app' => $this->appName]);
+		}
+
+		if ($expectedException) {
+			$this->expectException($expectedException);
+			$this->expectExceptionMessage($expectedExceptionMessage);
+
+			$this->controller->updateMetaData($fileId, $metaData);
+		} elseif ($expectedResponseData !== null) {
+			$response = $this->controller->updateMetaData($fileId, $metaData);
+			$this->assertInstanceOf(DataResponse::class, $response);
+			$this->assertSame($expectedResponseStatus, $response->getStatus());
+			$this->assertSame($expectedResponseData, $response->getData());
+		} else {
+			$response = $this->controller->updateMetaData($fileId, $metaData);
+			$this->assertInstanceOf(DataResponse::class, $response);
+			$this->assertEquals([
+				'meta-data' => $metaData,
+			], $response->getData());
+		}
+	}
+
+	public static function updateMetaDataDataProvider(): array {
+		return [
+			[false, null, null, null, null, null, false],
+			[true, null, null, null, ['message' => 'Folder is not locked'], 412, false],
+			[false, new MissingMetaDataException(), OCSNotFoundException::class, 'Metadata-file does not exist', null, null, false],
+			[false, new NotFoundException('Exception Message'), OCSNotFoundException::class, 'Exception Message', null, null, false],
+			[false, new \Exception(), OCSBadRequestException::class, 'Cannot store metadata', null, null, true],
+		];
+	}
+
+	#[DataProvider('deleteMetaDataDataProvider')]
+	public function testDeleteMetaData(?\Exception $metaDataStorageException,
+		?string $expectedException,
+		?string $expectedExceptionMessage,
+		?array $expectedResponseData,
+		?int $expectedResponseStatus,
+		bool $expectLogger): void {
+		$fileId = 42;
+
+		$this->accessManager->method('getOwnerId')
+			->willReturnMap([
+				[$fileId, 'john.doe'],
+			]);
+
+		if ($metaDataStorageException) {
+			$this->metaDataStorage->expects($this->once())
+				->method('updateMetaDataIntoIntermediateFile')
+				->with('john.doe', $fileId, '{}', 'e2e-token', '')
+				->willThrowException($metaDataStorageException);
+		} else {
+			$this->metaDataStorage->expects($this->once())
+				->method('updateMetaDataIntoIntermediateFile')
+				->with('john.doe', $fileId, '{}', 'e2e-token', '');
+		}
+
+		$this->request->expects($this->once())
+			->method('getHeader')
+			->with('e2e-token')
+			->willReturn('e2e-token');
+
+		$this->l10n->method('t')
+			->willReturnCallback(static fn ($string, $args): string => vsprintf($string, $args));
+
+		if ($expectLogger) {
+			$this->logger->expects($this->once())
+				->method('critical')
+				->with($metaDataStorageException->getMessage(), ['exception' => $metaDataStorageException, 'app' => $this->appName]);
+		}
+
+		if ($expectedException) {
+			$this->expectException($expectedException);
+			$this->expectExceptionMessage($expectedExceptionMessage);
+
+			$this->controller->deleteMetaData($fileId);
+		} elseif ($expectedResponseData !== null) {
+			$response = $this->controller->deleteMetaData($fileId);
+			$this->assertInstanceOf(DataResponse::class, $response);
+			$this->assertSame($expectedResponseStatus, $response->getStatus());
+			$this->assertSame($expectedResponseData, $response->getData());
+		} else {
+			$response = $this->controller->deleteMetaData($fileId);
+			$this->assertInstanceOf(DataResponse::class, $response);
+			$this->assertEquals([], $response->getData());
+		}
+	}
+
+	public static function deleteMetaDataDataProvider(): array {
+		return [
+			[null, null, null, null, null, false],
+			[new NotFoundException(), OCSNotFoundException::class, 'Could not find metadata for "42"', null, null, false],
+			[new NotPermittedException(), null, null, ['message' => 'You are not allowed to delete the metadata of this folder'], 403, false],
+			[new \Exception(), OCSBadRequestException::class, 'Cannot delete metadata', null, null, true],
+		];
+	}
+
+	public function testAddMetadataFileDropUnauthenticatedShare(): void {
+		$this->mockFileDropShare(42, false);
+
+		$this->lockManager->expects($this->never())
+			->method('lockFile');
+
+		$response = $this->getGuestController()->addMetadataFileDrop(42, '{}', 'token123');
+		$this->assertSame(403, $response->getStatus());
+		$this->assertSame(['message' => 'You are not allowed to create the lock'], $response->getData());
+	}
+
+	public function testAddMetadataFileDropAuthenticatedShare(): void {
+		$this->mockFileDropShare(42, true);
+
+		$this->lockManager->expects($this->once())
+			->method('lockFile')
+			->with(42, 'filedrop-lock', 0, 'john.doe', true)
+			->willReturn('lock-token');
+		$this->metaDataStorage->method('getMetaData')
+			->willReturn('{"filedrop":{"a":{"key":"a"}}}');
+		$this->metaDataStorage->expects($this->once())
+			->method('updateMetaDataIntoIntermediateFile')
+			->with('john.doe', 42, '{"filedrop":{"a":{"key":"a"},"b":{"key":"b"}}}', 'filedrop-lock');
+
+		$response = $this->getGuestController()->addMetadataFileDrop(42, '{"b":{"key":"b"}}', 'token123');
+		$this->assertSame(200, $response->getStatus());
+		$this->assertSame(['filedrop' => ['b' => ['key' => 'b']]], $response->getData());
+	}
+
+	/**
+	 * Mock an encrypted file drop share of john.doe on the folder with the given id
+	 */
+	private function mockFileDropShare(int $folderId, bool $isAuthenticated): void {
+		$folder = $this->createStub(Folder::class);
+		$folder->method('getId')->willReturn($folderId);
+		$folder->method('isEncrypted')->willReturn(true);
+
+		$share = $this->createStub(IShare::class);
+		$share->method('getShareOwner')->willReturn('john.doe');
+		$share->method('getPermissions')->willReturn(Constants::PERMISSION_CREATE);
+		$share->method('getNode')->willReturn($folder);
+		$this->shareManager->method('getShareByToken')
+			->willReturnMap([['token123', $share]]);
+		$this->accessManager->method('isShareAuthenticated')
+			->willReturnMap([[$share, $isAuthenticated]]);
+
+		$userFolder = $this->createStub(IUserFolder::class);
+		$userFolder->method('getId')->willReturn(1);
+		$userFolder->method('getFirstNodeById')
+			->willReturnMap([[$folderId, $folder]]);
+		$this->rootFolder->method('getUserFolder')
+			->willReturnMap([['john.doe', $userFolder]]);
+
+		$this->l10n->method('t')
+			->willReturnArgument(0);
+	}
+
+	private function getGuestController(): MetaDataController {
+		return new MetaDataController(
+			$this->appName,
+			$this->request,
+			null,
+			$this->metaDataStorage,
+			$this->lockManager,
+			$this->logger,
+			$this->l10n,
+			$this->shareManager,
+			$this->rootFolder,
+			$this->accessManager,
+		);
+	}
+}

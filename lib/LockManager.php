@@ -1,0 +1,158 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * SPDX-FileCopyrightText: 2017 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+namespace OCA\EndToEndEncryption;
+
+use OCA\EndToEndEncryption\Db\Lock;
+use OCA\EndToEndEncryption\Db\LockMapper;
+use OCA\EndToEndEncryption\Exceptions\FileLockedException;
+use OCA\EndToEndEncryption\Exceptions\FileNotLockedException;
+use OCP\AppFramework\Db\DoesNotExistException;
+use OCP\AppFramework\Utility\ITimeFactory;
+use OCP\Files\InvalidPathException;
+use OCP\Files\IRootFolder;
+use OCP\Files\NotFoundException;
+use OCP\Files\NotPermittedException;
+use OCP\IUserSession;
+use OCP\Security\ISecureRandom;
+
+/**
+ * Handle end-to-end encryption file locking
+ *
+ * @package OCA\EndToEndEncryption
+ */
+class LockManager {
+	public function __construct(
+		private readonly LockMapper $lockMapper,
+		private readonly ISecureRandom $secureRandom,
+		private readonly IRootFolder $rootFolder,
+		private readonly IUserSession $userSession,
+		private readonly ITimeFactory $timeFactory,
+		private readonly IMetaDataStorage $metaDataStorage,
+	) {
+	}
+
+	/**
+	 * Lock file
+	 * @param bool $noCounterCheck - Needed for filedrop, which updates the metadata without needing to bump the counter
+	 * @throws NotPermittedException - The internal counter is greater than the provided one
+	 */
+	public function lockFile(int $id, string $token, int $e2eCounter, string $ownerId, bool $noCounterCheck = false): ?string {
+		if ($this->isLocked($id, $token, $ownerId)) {
+			return null;
+		}
+
+		try {
+			$lock = $this->lockMapper->getByFileId($id);
+			return $lock->getToken() === $token ? $token : null;
+		} catch (DoesNotExistException) {
+			if (!$noCounterCheck) {
+				$storedCounter = $this->metaDataStorage->getCounter($id);
+				if ($storedCounter >= $e2eCounter) {
+					throw new NotPermittedException('Received counter is not greater than the stored one');
+				}
+			}
+
+			$newToken = $this->getToken();
+			$lockEntity = new Lock();
+			$lockEntity->setId($id);
+			$lockEntity->setTimestamp($this->timeFactory->getTime());
+			$lockEntity->setToken($newToken);
+			$this->lockMapper->insert($lockEntity);
+
+			if (!$noCounterCheck) {
+				try {
+					$this->metaDataStorage->saveIntermediateCounter($id, $e2eCounter);
+				} catch (NotFoundException) {
+					// This just means that the metadata does not exists yet.
+				}
+			}
+
+			return $newToken;
+		}
+	}
+
+	/**
+	 * Unlock file
+	 *
+	 * @throws FileLockedException
+	 * @throws FileNotLockedException
+	 */
+	public function unlockFile(int $id, string $token): void {
+		try {
+			$lock = $this->lockMapper->getByFileId($id);
+		} catch (DoesNotExistException) {
+			throw new FileNotLockedException();
+		}
+
+		if ($lock->getToken() !== $token) {
+			throw new FileLockedException();
+		}
+
+		$this->metaDataStorage->clearTouchedFolders($lock->getToken());
+		$this->lockMapper->delete($lock);
+	}
+
+	/**
+	 * Check if a file or a parent folder is locked
+	 *
+	 * @param $requireLock - Specify whether we want to assert that the the folder is locked by the given token.
+	 *
+	 * @throws InvalidPathException
+	 * @throws NotFoundException
+	 * @throws \OCP\Files\NotPermittedException
+	 */
+	public function isLocked(int $id, string $token, ?string $ownerId = null, bool $requireLock = false): bool {
+		if ($ownerId === null) {
+			$user = $this->userSession->getUser();
+			if ($user === null) {
+				throw new NotPermittedException('No active user-session');
+			}
+			$ownerId = $user->getUid();
+		}
+
+		$lockedByGivenToken = false;
+
+		$userRoot = $this->rootFolder->getUserFolder($ownerId);
+		$nodes = $userRoot->getById($id);
+		foreach ($nodes as $node) {
+			while ($node->getPath() !== '/') {
+				try {
+					$lock = $this->lockMapper->getByFileId($node->getId());
+				} catch (DoesNotExistException) {
+					// If this node is not locked, just check the parent one
+					$node = $node->getParent();
+					continue;
+				}
+
+				// If it's locked with a different token, return true
+				if ($lock->getToken() !== $token) {
+					return true;
+				} else {
+					$lockedByGivenToken = true;
+				}
+
+				// If it's locked with the expected token, check the parent node
+				$node = $node->getParent();
+			}
+		}
+
+		if ($requireLock) {
+			return !$lockedByGivenToken;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Generate a new token
+	 */
+	private function getToken(): string {
+		return $this->secureRandom->generate(64, ISecureRandom::CHAR_UPPER . ISecureRandom::CHAR_LOWER . ISecureRandom::CHAR_DIGITS);
+	}
+}

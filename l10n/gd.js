@@ -1,0 +1,19 @@
+OC.L10N.register(
+    "end_to_end_encryption",
+    {
+    "Folder name" : "Ainm a’ phasgain",
+    "Download" : "Luchdaich a-nuas",
+    "Unknown" : "Chan eil fhios",
+    "File" : "Faidhle",
+    "Password" : "Facal-faire",
+    "Note to recipient" : "Nòta dhan fhaightear",
+    "Close" : "Dùin",
+    "Read only" : "Ri leughadh a-mhàin",
+    "Edit" : "Deasaich",
+    "Remove" : "Thoir air falbh",
+    "Save" : "Sàbhail",
+    "Upload failed" : "Dh'fhàillig leis an luchdadh suas",
+    "Uploading…" : "’Ga luchdadh suas…",
+    "Cancel" : "Sguir dheth"
+},
+"nplurals=4; plural=(n==1 || n==11) ? 0 : (n==2 || n==12) ? 1 : (n > 2 && n < 20) ? 2 : 3;");

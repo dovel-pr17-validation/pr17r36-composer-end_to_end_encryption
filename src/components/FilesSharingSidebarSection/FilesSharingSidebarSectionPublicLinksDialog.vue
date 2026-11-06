@@ -1,0 +1,227 @@
+<!--
+	- SPDX-FileCopyrightText: 2025 Nextcloud GmbH and Nextcloud contributors
+	- SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+
+<script setup lang="ts">
+import type { RootMetadata } from '../../models/RootMetadata.ts'
+import type { IShare } from '../../services/sharing.ts'
+
+import { isAxiosError } from '@nextcloud/axios'
+import { getCapabilities } from '@nextcloud/capabilities'
+import { showError } from '@nextcloud/dialogs'
+import { Permission } from '@nextcloud/files'
+import { t } from '@nextcloud/l10n'
+import stringify from 'safe-stable-stringify'
+import { computed, ref, toRaw, watchEffect } from 'vue'
+import NcButton from '@nextcloud/vue/components/NcButton'
+import NcDialog from '@nextcloud/vue/components/NcDialog'
+import NcFormBox from '@nextcloud/vue/components/NcFormBox'
+import NcFormBoxCopyButton from '@nextcloud/vue/components/NcFormBoxCopyButton'
+import NcNoteCard from '@nextcloud/vue/components/NcNoteCard'
+import NcPasswordField from '@nextcloud/vue/components/NcPasswordField'
+import NcRadioGroup from '@nextcloud/vue/components/NcRadioGroup'
+import NcRadioGroupButton from '@nextcloud/vue/components/NcRadioGroupButton'
+import NcTextArea from '@nextcloud/vue/components/NcTextArea'
+import NcTextField from '@nextcloud/vue/components/NcTextField'
+import * as api from '../../services/api.ts'
+import logger from '../../services/logger.ts'
+import { reencryptSubfolders } from '../../services/metadata.ts'
+import { createFileDropShare, createPublicLinkShare, getShareUrl } from '../../services/sharing.ts'
+import * as keyStore from '../../store/keys.ts'
+import * as metadataStore from '../../store/metadata.ts'
+
+const props = defineProps<{
+	share?: IShare
+	metadata: RootMetadata
+	/** Create an email share instead of a link share */
+	isEmailShare?: boolean
+}>()
+
+defineEmits<{
+	close: [share?: IShare]
+}>()
+
+const Permissions = Object.freeze({
+	UploadOnly: 'upload',
+	ViewOnly: 'view',
+	ViewAndUpload: 'upload+view',
+})
+
+const isLoading = ref(false)
+const sharePermissions = ref<typeof Permissions[keyof typeof Permissions]>(Permissions.UploadOnly)
+watchEffect(() => {
+	if (props.share) {
+		const permissions = props.share.permissions as number
+		sharePermissions.value = (permissions & Permission.UPDATE)
+			? Permissions.ViewAndUpload
+			: (permissions & Permission.READ)
+					? Permissions.ViewOnly
+					: Permissions.UploadOnly
+	}
+})
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const isPasswordEnforced = (getCapabilities() as any).files_sharing?.public?.password?.enforced === true
+const email = ref('')
+const password = ref('')
+const note = ref('')
+
+const sharedMnemonic = ref<string>()
+const internalShare = ref<IShare>()
+const shareUrl = computed(() => internalShare.value && getShareUrl(internalShare.value))
+
+/**
+ * Create a new end-to-end link share
+ */
+async function createShare() {
+	logger.debug('Creating end-to-end link share')
+	const metadata = toRaw(props.metadata)
+	if (!metadata) {
+		throw new Error('No metadata available for the current folder')
+	}
+
+	const { path, id } = metadataStore.getRootFolder(metadata)
+	if (sharePermissions.value === Permissions.UploadOnly) {
+		try {
+			internalShare.value = await createFileDropShare(path, { email: email.value || undefined, password: password.value, note: note.value })
+		} catch (error) {
+			logger.error('Failed to create file drop share', { error })
+			const message = isAxiosError(error) ? error.response?.data?.ocs?.meta?.message : undefined
+			showError(message || t('end_to_end_encryption', 'Failed to create the file drop share.'))
+		}
+		return
+	}
+
+	isLoading.value = true
+	const token = await api.lockFolder(id, metadata.counter + 1)
+	try {
+		// we need to reencrypt all folders later with the new key
+		const subfolders = await metadataStore.loadAllSubfolders(metadata)
+
+		let result: Awaited<ReturnType<typeof createPublicLinkShare>>
+		try {
+			result = await createPublicLinkShare(path, metadata, sharePermissions.value === Permissions.ViewOnly, email.value || undefined)
+		} catch (error) {
+			logger.error('Failed to create link share', { error })
+			const message = isAxiosError(error) ? error.response?.data?.ocs?.meta?.message : undefined
+			showError(message || t('end_to_end_encryption', 'Failed to create the link share.'))
+			return
+		}
+
+		const { share, mnemonic } = result
+		internalShare.value = share
+		sharedMnemonic.value = mnemonic.join(' ')
+
+		// update the metadata to re-encrypt with the new key
+		const { metadata: rawMetadata, signature } = await metadata.export(await keyStore.getCertificate())
+		await api.updateMetadata(id, stringify(rawMetadata), token, signature)
+		// re-encrypt all subfolders
+		await reencryptSubfolders(subfolders, metadata.key, await keyStore.getCertificate(), token)
+		return
+	} finally {
+		await api.unlockFolder(id, token)
+	}
+}
+</script>
+
+<template>
+	<NcDialog
+		isForm
+		:contentClasses="$style.publicLinksDialog"
+		:name="isEmailShare ? t('end_to_end_encryption', 'End-to-end encrypted email share') : t('end_to_end_encryption', 'End-to-end encrypted link share')"
+		@submit="createShare"
+		@update:open="$event || $emit('close', internalShare)">
+		<NcTextField
+			v-if="isEmailShare"
+			v-model="email"
+			autocomplete="email"
+			:disabled="!!internalShare"
+			:label="t('end_to_end_encryption', 'Email address')"
+			required
+			type="email" />
+		<NcRadioGroup
+			v-model="sharePermissions"
+			:disabled="!!internalShare"
+			:label="t('end_to_end_encryption', 'Permissions')">
+			<NcRadioGroupButton
+				:label="t('end_to_end_encryption', 'Upload only')"
+				:value="Permissions.UploadOnly" />
+			<NcRadioGroupButton
+				:label="t('end_to_end_encryption', 'View only')"
+				:value="Permissions.ViewOnly" />
+			<NcRadioGroupButton
+				:label="t('end_to_end_encryption', 'View and upload')"
+				:value="Permissions.ViewAndUpload" />
+		</NcRadioGroup>
+
+		<p v-if="sharePermissions === Permissions.ViewOnly" :class="$style.publicLinksDialog__hint">
+			{{ t('end_to_end_encryption', 'Unlike upload-only shares view-only shares require a trusted server to enforce the restriction.') }}
+		</p>
+
+		<template v-if="sharePermissions === Permissions.UploadOnly">
+			<NcPasswordField
+				v-model="password"
+				autocomplete="new-password"
+				checkPasswordStrength
+				:disabled="!!internalShare"
+				:helperText="isPasswordEnforced ? undefined : t('end_to_end_encryption', 'Leave empty to share without password.')"
+				:label="t('end_to_end_encryption', 'Password')"
+				:required="isPasswordEnforced" />
+			<NcTextArea
+				v-model="note"
+				:disabled="!!internalShare"
+				:label="t('end_to_end_encryption', 'Note to recipient')"
+				resize="vertical" />
+		</template>
+
+		<template v-if="shareUrl">
+			<NcFormBox :class="$style.publicLinksDialog__formBox">
+				<NcFormBoxCopyButton
+					:label="t('end_to_end_encryption', 'Share url')"
+					:value="shareUrl" />
+				<NcFormBoxCopyButton
+					v-if="sharedMnemonic"
+					:label="t('end_to_end_encryption', 'Mnemonic')"
+					:value="sharedMnemonic" />
+			</NcFormBox>
+
+			<NcNoteCard v-if="isEmailShare" type="success">
+				{{ t('end_to_end_encryption', 'The share link was sent to {email}.', { email: internalShare!.share_with }) }}
+			</NcNoteCard>
+			<NcNoteCard v-if="sharedMnemonic" type="info">
+				{{ t('end_to_end_encryption', 'Please share the secret mnemonic with the recipient using a secure second channel.') }}
+			</NcNoteCard>
+		</template>
+
+		<template #actions>
+			<NcButton v-if="!internalShare" type="submit" variant="primary">
+				<template v-if="isEmailShare">
+					{{ t('end_to_end_encryption', 'Create email share') }}
+				</template>
+				<template v-else>
+					{{ share ? t('end_to_end_encryption', 'Update link share') : t('end_to_end_encryption', 'Create link share') }}
+				</template>
+			</NcButton>
+			<NcButton v-else variant="primary" @click="$emit('close', internalShare)">
+				{{ t('end_to_end_encryption', 'Close') }}
+			</NcButton>
+		</template>
+	</NcDialog>
+</template>
+
+<style module>
+.publicLinksDialog {
+	display: flex;
+	flex-direction: column;
+	gap: var(--default-grid-baseline);
+}
+
+.publicLinksDialog__hint {
+	color: var(--color-text-maxcontrast);
+}
+
+.publicLinksDialog__formBox {
+	margin-top: 1rem;
+}
+</style>

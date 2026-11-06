@@ -1,0 +1,16 @@
+OC.L10N.register(
+    "end_to_end_encryption",
+    {
+    "Folder name" : "Qovluq adı",
+    "Continue" : "Davam et",
+    "Download" : "Yüklə",
+    "Close" : "Bağla",
+    "Read only" : "Oxumaq üçün",
+    "Edit" : "Dəyişiklik et",
+    "Save" : "Saxla",
+    "Upload failed" : "Yüklənmədə səhv baş verdi",
+    "Limit to groups" : "Qruplara limitlə",
+    "Limit app usage to groups" : "Tətbiqin istifadəsini qruplar üçün limitlə",
+    "Cancel" : "Cancel"
+},
+"nplurals=2; plural=(n != 1);");

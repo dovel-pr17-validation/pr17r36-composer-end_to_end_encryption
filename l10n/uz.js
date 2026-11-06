@@ -1,0 +1,26 @@
+OC.L10N.register(
+    "end_to_end_encryption",
+    {
+    "Internal error" : "Ichki xato",
+    "End-to-End Encryption" : "End-to-end shifrlash",
+    "Submit" : "Submit",
+    "Folder name" : "Papka nomi",
+    "Continue" : "Davom etish",
+    "Download" : "Yuklab olish",
+    "Unknown" : "Noma'lum",
+    "Folder" : "Jild",
+    "File" : "Fayl",
+    "Email share" : "Elektron pochta orqali ulashish",
+    "Email address" : "E-pochta manzili",
+    "Permissions" : "Ruxsatnomalar",
+    "Password" : "Parol",
+    "Note to recipient" : "Qabul qiluvchiga eslatma",
+    "Close" : "Yopish",
+    "Read only" : "Faqat o'qish",
+    "Edit" : "Tahrirlash",
+    "Remove" : "O'chirish",
+    "Save" : "Save",
+    "Uploading…" : "Yuklanmoqda...",
+    "Cancel" : "Bekor qilish"
+},
+"nplurals=1; plural=0;");

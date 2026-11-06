@@ -1,0 +1,66 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * SPDX-FileCopyrightText: 2020 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+namespace OCA\EndToEndEncryption\Middleware;
+
+use OCA\EndToEndEncryption\IMetaDataStorage;
+use OCA\EndToEndEncryption\MetaDataVersion;
+use OCP\AppFramework\Middleware;
+use OCP\AppFramework\OCS\OCSForbiddenException;
+use OCP\Files\NotFoundException;
+use OCP\IRequest;
+
+/**
+ * Class ClientHasCapabilityMiddleware
+ *
+ * @package OCA\EndToEndEncryption\Middleware
+ */
+class ClientHasCapabilityMiddleware extends Middleware {
+	public function __construct(
+		private readonly IRequest $request,
+		private readonly IMetaDataStorage $metadataStorage,
+		private readonly ?string $userId,
+	) {
+	}
+
+	/**
+	 * @param \OCP\AppFramework\Controller $controller
+	 * @param string $methodName
+	 * @throws OCSForbiddenException
+	 */
+	public function beforeController($controller, $methodName): void {
+		parent::beforeController($controller, $methodName);
+
+		$pathInfo = $this->request->getPathInfo();
+
+		if ($pathInfo === false) {
+			return;
+		}
+
+		if (!str_contains($pathInfo, '/apps/end_to_end_encryption/api/v1/meta-data/')) {
+			return;
+		}
+
+		$fileId = $this->request->getParam('id');
+		try {
+			$metadata = $this->metadataStorage->getMetaData($this->userId ?? '', (int)$fileId);
+		} catch (NotFoundException) {
+			// There is no metadata version to validate. Let the controller
+			// handle missing metadata or create the initial metadata.
+			return;
+		}
+
+		$decodedMetadata = json_decode($metadata, true);
+
+		if (MetaDataVersion::isV1($decodedMetadata['metadata']['version'])) {
+			return;
+		}
+
+		throw new OCSForbiddenException('Client version cannot handle the requested encryption version.');
+	}
+}

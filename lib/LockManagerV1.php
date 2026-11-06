@@ -1,0 +1,156 @@
+<?php
+
+declare(strict_types=1);
+/**
+ * SPDX-FileCopyrightText: 2017 Nextcloud GmbH and Nextcloud contributors
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+namespace OCA\EndToEndEncryption;
+
+use OCA\EndToEndEncryption\Db\Lock;
+use OCA\EndToEndEncryption\Db\LockMapper;
+use OCA\EndToEndEncryption\Exceptions\FileLockedException;
+use OCA\EndToEndEncryption\Exceptions\FileNotLockedException;
+use OCP\AppFramework\Db\DoesNotExistException;
+use OCP\AppFramework\Utility\ITimeFactory;
+use OCP\Files\InvalidPathException;
+use OCP\Files\IRootFolder;
+use OCP\Files\NotFoundException;
+use OCP\Files\NotPermittedException;
+use OCP\IUserSession;
+use OCP\Security\ISecureRandom;
+
+/**
+ * Handle end-to-end encryption file locking
+ *
+ * @package OCA\EndToEndEncryption
+ */
+class LockManagerV1 {
+	public function __construct(
+		private readonly LockMapper $lockMapper,
+		private readonly ISecureRandom $secureRandom,
+		private readonly IRootFolder $rootFolder,
+		private readonly IUserSession $userSession,
+		private readonly ITimeFactory $timeFactory,
+	) {
+	}
+
+	/**
+	 * Lock file
+	 */
+	public function lockFile(int $id, string $token = '', ?string $ownerId = null): ?string {
+		if ($this->isLocked($id, $token, $ownerId)) {
+			return null;
+		}
+
+		try {
+			$lock = $this->lockMapper->getByFileId($id);
+			return $lock->getToken() === $token ? $token : null;
+		} catch (DoesNotExistException) {
+			$newToken = $this->getToken();
+			$lockEntity = new Lock();
+			$lockEntity->setId($id);
+			$lockEntity->setTimestamp($this->timeFactory->getTime());
+			$lockEntity->setToken($newToken);
+			$this->lockMapper->insert($lockEntity);
+			return $newToken;
+		}
+	}
+
+	/**
+	 * Unlock file
+	 *
+	 * @throws FileLockedException
+	 * @throws FileNotLockedException
+	 */
+	public function unlockFile(int $id, string $token): void {
+		$this->lockMapper->delete($this->getLock($id, $token));
+	}
+
+	/**
+	 * Assert the file is locked with the given token, without releasing the lock
+	 *
+	 * @throws FileLockedException The file is locked with a different token
+	 * @throws FileNotLockedException The file is not locked
+	 */
+	public function assertLockedByToken(int $id, string $token): void {
+		$this->getLock($id, $token);
+	}
+
+	/**
+	 * @throws FileLockedException The file is locked with a different token
+	 * @throws FileNotLockedException The file is not locked
+	 */
+	private function getLock(int $id, string $token): Lock {
+		try {
+			$lock = $this->lockMapper->getByFileId($id);
+		} catch (DoesNotExistException) {
+			throw new FileNotLockedException();
+		}
+
+		if ($lock->getToken() !== $token) {
+			throw new FileLockedException();
+		}
+
+		return $lock;
+	}
+
+	/**
+	 * Check if a file or a parent folder is locked
+	 *
+	 * @param $requireLock - Specify whether we want to assert that the the folder is locked by the given token.
+	 *
+	 * @throws InvalidPathException
+	 * @throws NotFoundException
+	 * @throws \OCP\Files\NotPermittedException
+	 */
+	public function isLocked(int $id, string $token, ?string $ownerId = null, bool $requireLock = false): bool {
+		if ($ownerId === null) {
+			$user = $this->userSession->getUser();
+			if ($user === null) {
+				throw new NotPermittedException('No active user-session');
+			}
+			$ownerId = $user->getUid();
+		}
+
+		$lockedByGivenToken = false;
+
+		$userRoot = $this->rootFolder->getUserFolder($ownerId);
+		$nodes = $userRoot->getById($id);
+		foreach ($nodes as $node) {
+			while ($node->getPath() !== '/') {
+				try {
+					$lock = $this->lockMapper->getByFileId($node->getId());
+				} catch (DoesNotExistException) {
+					// If this node is not locked, just check the parent one
+					$node = $node->getParent();
+					continue;
+				}
+
+				// If it's locked with a different token, return true
+				if ($lock->getToken() !== $token) {
+					return true;
+				} else {
+					$lockedByGivenToken = true;
+				}
+
+				// If it's locked with the expected token, check the parent node
+				$node = $node->getParent();
+			}
+		}
+
+		if ($requireLock) {
+			return !$lockedByGivenToken;
+		}
+
+		return false;
+	}
+
+	/**
+	 * Generate a new token
+	 */
+	private function getToken(): string {
+		return $this->secureRandom->generate(64, ISecureRandom::CHAR_UPPER . ISecureRandom::CHAR_LOWER . ISecureRandom::CHAR_DIGITS);
+	}
+}

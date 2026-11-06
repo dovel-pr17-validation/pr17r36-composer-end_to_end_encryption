@@ -1,0 +1,15 @@
+diff --git a/.github/workflows/update-nextcloud-ocp.yml b/.github/workflows/update-nextcloud-ocp.yml
+index bc3b4241..1429c404 100644
+--- a/.github/workflows/update-nextcloud-ocp.yml
++++ b/.github/workflows/update-nextcloud-ocp.yml
+@@ -34,9 +34,7 @@ jobs:
+       matrix:
+         branches:
+           - ${{ github.event.repository.default_branch }}
+-          - 'stable35'
+-          - 'stable34'
+-          - 'stable33'
++          - 'stable-2'
+ 
+     name: update-nextcloud-ocp-${{ matrix.branches }}
+ 

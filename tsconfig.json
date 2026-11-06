@@ -1,0 +1,26 @@
+{
+	"extends": "@vue/tsconfig/tsconfig.json",
+	"include": [
+		"./src/**/*.ts",
+		"./src/**/*.vue"
+	],
+	"exclude": [
+		"./src/**/*.spec.ts"
+	],
+	"compilerOptions": {
+		"lib": [
+			"DOM",
+			"ESNext",
+		],
+		"types": [
+			"@types/wicg-file-system-access"
+		],
+		"rootDir": "src",
+		"allowSyntheticDefaultImports": true,
+		"noImplicitAny": false,
+		"allowImportingTsExtensions": true
+	},
+	"vueCompilerOptions": {
+		"target": 3.6
+	}
+}

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<files psalm-version="6.15.0@204d06619833a297b402cbc66be7f2df74437db4">
+  <file src="lib/Connector/Sabre/APlugin.php">
+    <UndefinedPropertyFetch>
+      <code><![CDATA[$this->server->tree]]></code>
+    </UndefinedPropertyFetch>
+  </file>
+  <file src="lib/Connector/Sabre/PropFindPlugin.php">
+    <UndefinedMethod>
+      <code><![CDATA[getName]]></code>
+      <code><![CDATA[getProperties]]></code>
+    </UndefinedMethod>
+    <UndefinedPropertyFetch>
+      <code><![CDATA[$this->server->tree]]></code>
+    </UndefinedPropertyFetch>
+  </file>
+  <file src="lib/Connector/Sabre/RedirectRequestPlugin.php">
+    <UndefinedPropertyFetch>
+      <code><![CDATA[$this->server->tree]]></code>
+    </UndefinedPropertyFetch>
+  </file>
+  <file src="lib/FileService.php">
+    <UndefinedInterfaceMethod>
+      <code><![CDATA[unshareStorage]]></code>
+    </UndefinedInterfaceMethod>
+  </file>
+</files>
